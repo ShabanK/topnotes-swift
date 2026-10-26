@@ -143,6 +143,19 @@ final class NotesStore: ObservableObject {
         notes[i].name = trimmed.isEmpty ? nil : trimmed
     }
 
+    /// A binding that finds the note by id on every read/write. Index-based bindings
+    /// ($notes[i]) crash if a text field writes back after its note is gone.
+    func binding<T>(_ id: UUID, _ keyPath: WritableKeyPath<Note, T>, default fallback: T) -> Binding<T> {
+        Binding(
+            get: { self.notes.first { $0.id == id }?[keyPath: keyPath] ?? fallback },
+            set: { value in
+                guard let i = self.notes.firstIndex(where: { $0.id == id }) else { return }
+                self.notes[i][keyPath: keyPath] = value
+                self.notes[i].updated = Date()
+            }
+        )
+    }
+
     func canShift(_ id: UUID, by offset: Int) -> Bool {
         guard let i = notes.firstIndex(where: { $0.id == id }) else { return false }
         return notes.indices.contains(i + offset)
@@ -329,9 +342,9 @@ struct NotesView: View {
                 if cloaked {
                     CloakedView(note: note)
                 } else if note.isChecklist {
-                    ChecklistEditor(items: $store.notes[i].items)
+                    ChecklistEditor(items: store.binding(note.id, \.items, default: []))
                 } else {
-                    TextEditor(text: $store.notes[i].text)
+                    TextEditor(text: store.binding(note.id, \.text, default: ""))
                         .font(.system(size: 13))
                         .foregroundStyle(.black.opacity(0.85))
                         .scrollContentBackground(.hidden)
@@ -340,8 +353,6 @@ struct NotesView: View {
                         .onAppear { editorFocused = true }
                 }
             }
-            .onChange(of: store.notes[i].text) { store.notes[i].updated = Date() }
-            .onChange(of: store.notes[i].items) { store.notes[i].updated = Date() }
 
             HStack(spacing: 10) {
                 Button { store.cycleColor(note.id) } label: { Image(systemName: "paintpalette") }
@@ -411,13 +422,16 @@ struct CloakedView: View {
 struct ChecklistEditor: View {
     @Binding var items: [CheckItem]
     @FocusState private var focused: UUID?
+    @State private var keyMonitor: Any?
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 2) {
-                ForEach($items) { $item in
+                ForEach(items) { item in
+                    let text = binding(item.id, \.text, default: "")
+                    let done = binding(item.id, \.done, default: false)
                     HStack(alignment: .firstTextBaseline, spacing: 8) {
-                        Button { item.done.toggle() } label: {
+                        Button { done.wrappedValue.toggle() } label: {
                             Image(systemName: item.done ? "checkmark.square.fill" : "square")
                                 .font(.system(size: 14))
                         }
@@ -431,22 +445,21 @@ struct ChecklistEditor: View {
                                 .opacity(0.45)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .contentShape(Rectangle())
-                                .onTapGesture { item.done = false; focused = item.id }
+                                .onTapGesture { done.wrappedValue = false; focused = item.id }
                                 .help("Click to untick and edit")
                         } else {
-                        TextField("List item", text: $item.text, axis: .vertical)
+                        TextField("List item", text: text, axis: .vertical)
                             .textFieldStyle(.plain)
                             .font(.system(size: 13))
                             .focused($focused, equals: item.id)
                             .onSubmit { insert(after: item.id) }
-                            .onKeyPress(.delete) {
-                                guard item.text.isEmpty else { return .ignored }
-                                remove(item.id)
-                                return .handled
-                            }
                         }
 
                         Button { remove(item.id) } label: { Image(systemName: "xmark").font(.system(size: 9)) }
+                            .background(GeometryReader { g in
+                                let _ = DebugProbe.itemDeleteFrames[item.id] = g.frame(in: .global)
+                                Color.clear
+                            })
                             .buttonStyle(.borderless)
                             .opacity(0.4)
                             .help("Remove item")
@@ -464,7 +477,32 @@ struct ChecklistEditor: View {
             .foregroundStyle(.black.opacity(0.85))
             .padding(12)
         }
-        .onAppear { focused = items.first { $0.text.isEmpty }?.id }
+        .onAppear {
+            focused = items.first { $0.text.isEmpty }?.id
+            // The text field swallows Backspace before .onKeyPress sees it, so watch key events app-wide.
+            keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+                let isBackspace = event.keyCode == 51 && event.modifierFlags.intersection(.deviceIndependentFlagsMask).isEmpty
+                guard isBackspace, let id = focused, items.first(where: { $0.id == id })?.text.isEmpty == true else { return event }
+                remove(id)
+                return nil
+            }
+        }
+        .onDisappear {
+            if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
+            keyMonitor = nil
+        }
+    }
+
+    /// Looks the item up by id on every access, so a text field that ends editing after its
+    /// item was removed reads a placeholder and writes nowhere, instead of crashing.
+    private func binding<T>(_ id: UUID, _ keyPath: WritableKeyPath<CheckItem, T>, default fallback: T) -> Binding<T> {
+        Binding(
+            get: { items.first { $0.id == id }?[keyPath: keyPath] ?? fallback },
+            set: { value in
+                guard let i = items.firstIndex(where: { $0.id == id }) else { return }
+                items[i][keyPath: keyPath] = value
+            }
+        )
     }
 
     /// Return in an item adds a fresh one right below it.

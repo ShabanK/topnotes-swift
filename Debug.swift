@@ -147,11 +147,13 @@ final class KeyablePanel: NSPanel {
 enum DebugProbe {
     static var tabFrames: [UUID: CGRect] = [:]   // window coordinates, top-left origin
     static var eyeFrame: CGRect = .zero
+    static var itemDeleteFrames: [UUID: CGRect] = [:]
 }
 
 @MainActor
 func runInteractTestIfRequested() {
     guard UserDefaults.standard.bool(forKey: "interactTest") else { return }
+    setvbuf(stdout, nil, _IONBF, 0)   // keep the log if the app crashes mid-test
     let dir = URL(fileURLWithPath: UserDefaults.standard.string(forKey: "workDir") ?? NSTemporaryDirectory())
     let file = dir.appendingPathComponent("interact-notes.json")
     try? FileManager.default.removeItem(at: file)
@@ -282,6 +284,34 @@ func runInteractTestIfRequested() {
     snapshot("checklist-wrap.png")
     let after = store.notes.first { $0.isChecklist }!
     check(after.items.count == 2 && after.items[1].text.hasPrefix("a long"), "typing long text stays in one item")
+
+    // Removing items while one is being edited (this used to crash the app).
+    func listItems() -> [CheckItem] { store.notes.first { $0.isChecklist }!.items }
+    let focusedItem = listItems()[1]                       // the long item we are typing in
+    let x = DebugProbe.itemDeleteFrames[focusedItem.id]!
+    click(CGPoint(x: x.midX, y: x.midY)); spin(0.5)
+    check(listItems().map(\.text) == ["first item"], "× on the item being edited removes it (items: \(listItems().map(\.text)))")
+
+    click(CGPoint(x: DebugProbe.itemDeleteFrames[listItems()[0].id]!.midX - 200, y: DebugProbe.itemDeleteFrames[listItems()[0].id]!.midY))
+    type("more")
+    type("\n")                                             // Return adds an empty item below and focuses it
+    let beforeBackspace = listItems()
+    for t in [NSEvent.EventType.keyDown, .keyUp] {      // Backspace on the new empty item
+        NSApp.postEvent(NSEvent.keyEvent(with: t, location: .zero, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                                         windowNumber: window.windowNumber, context: nil, characters: "\u{7f}",
+                                         charactersIgnoringModifiers: "\u{7f}", isARepeat: false, keyCode: 51)!, atStart: false)
+    }
+    spin(0.5)
+    check(listItems().count == beforeBackspace.count - 1 && listItems().map(\.text) == ["first itemmore"],
+          "Backspace on an empty item removes it (before: \(beforeBackspace.map(\.text)), after: \(listItems().map(\.text)))")
+
+    // Remove every item, including the focused last one.
+    while let it = listItems().last, let f = DebugProbe.itemDeleteFrames[it.id], listItems().count > 0 {
+        let n = listItems().count
+        click(CGPoint(x: f.midX, y: f.midY)); spin(0.3)
+        if listItems().count == n { break }
+    }
+    check(listItems().isEmpty, "removing all items works (left: \(listItems().count))")
 
     print(failures == 0 ? "ALL PASSED" : "\(failures) FAILED")
     try? FileManager.default.removeItem(at: file)
