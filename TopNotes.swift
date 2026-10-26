@@ -205,6 +205,7 @@ struct NotesView: View {
     @State private var renameDraft = ""
     /// Notes start hidden and re-hide whenever the popover closes.
     @State private var cloaked = true
+    @State private var panel: NSWindow?
     @FocusState private var editorFocused: Bool
     @FocusState private var renameFocused: Bool
 
@@ -222,12 +223,20 @@ struct NotesView: View {
             }
         }
         .frame(width: 380, height: 360)
-        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didResignKeyNotification)) { _ in hide() }
-        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { _ in hide() }
+        .background(WindowReader { panel = $0 })
+        // Re-hide only when this popover closes. Becoming key is not a signal: right after launch the
+        // popover is open but not key, and the first click into it makes it key.
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didResignKeyNotification)) { n in
+            if let panel, n.object as? NSWindow === panel { hide() }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didChangeOcclusionStateNotification)) { n in
+            if let panel, n.object as? NSWindow === panel, !panel.occlusionState.contains(.visible) { hide() }
+        }
     }
 
     private func hide() {
         cloaked = true
+        DebugProbe.cloaked = true
         commitRename()
     }
 
@@ -361,7 +370,7 @@ struct NotesView: View {
                     Image(systemName: note.isChecklist ? "text.alignleft" : "checklist")
                 }
                 .help(note.isChecklist ? "Turn into plain text" : "Turn into a checklist")
-                Button { cloaked.toggle() } label: {
+                Button { cloaked.toggle(); DebugProbe.cloaked = cloaked } label: {
                     Image(systemName: cloaked ? "eye.slash" : "eye").frame(width: 18)
                 }
                 .help(cloaked ? "Show notes" : "Hide notes")
@@ -388,6 +397,28 @@ struct NotesView: View {
             .padding(.horizontal, 12).padding(.vertical, 8)
         }
         .background(Palette.color(note.color))
+    }
+}
+
+/// Reports the NSWindow hosting a SwiftUI view.
+struct WindowReader: NSViewRepresentable {
+    let onWindow: (NSWindow?) -> Void
+
+    func makeNSView(context: Context) -> NSView {
+        let view = TrackingView()
+        view.onWindow = onWindow
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {}
+
+    final class TrackingView: NSView {
+        var onWindow: ((NSWindow?) -> Void)?
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            let window = self.window
+            DispatchQueue.main.async { self.onWindow?(window) }
+        }
     }
 }
 
@@ -423,6 +454,7 @@ struct ChecklistEditor: View {
     @Binding var items: [CheckItem]
     @FocusState private var focused: UUID?
     @State private var keyMonitor: Any?
+    @State private var cursorToEndFor: UUID?
 
     var body: some View {
         ScrollView {
@@ -445,7 +477,7 @@ struct ChecklistEditor: View {
                                 .opacity(0.45)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .contentShape(Rectangle())
-                                .onTapGesture { done.wrappedValue = false; focused = item.id }
+                                .onTapGesture { done.wrappedValue = false; focusAtEnd(item.id) }
                                 .help("Click to untick and edit")
                         } else {
                         TextField("List item", text: text, axis: .vertical)
@@ -487,6 +519,13 @@ struct ChecklistEditor: View {
                 return nil
             }
         }
+        .onChange(of: focused) {
+            // Focus lands a beat after it is requested; select-all can happen then, so fix the cursor again.
+            if let target = cursorToEndFor, focused == target {
+                cursorToEndFor = nil
+                moveCursorToEnd()
+            }
+        }
         .onDisappear {
             if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
             keyMonitor = nil
@@ -505,6 +544,21 @@ struct ChecklistEditor: View {
         )
     }
 
+    /// Focus an item with the cursor at the end. A Mac text field selects all its text when it
+    /// gains focus, so move the selection once the field editor has taken over.
+    private func focusAtEnd(_ id: UUID?) {
+        cursorToEndFor = id
+        focused = id
+        moveCursorToEnd()
+    }
+
+    private func moveCursorToEnd() {
+        DispatchQueue.main.async {
+            guard let editor = NSApp.keyWindow?.firstResponder as? NSTextView else { return }
+            editor.setSelectedRange(NSRange(location: (editor.string as NSString).length, length: 0))
+        }
+    }
+
     /// Return in an item adds a fresh one right below it.
     private func insert(after id: UUID?) {
         let new = CheckItem()
@@ -517,7 +571,7 @@ struct ChecklistEditor: View {
     private func remove(_ id: UUID) {
         guard let i = items.firstIndex(where: { $0.id == id }) else { return }
         items.remove(at: i)
-        focused = items.isEmpty ? nil : items[max(0, i - 1)].id
+        focusAtEnd(items.isEmpty ? nil : items[max(0, i - 1)].id)
     }
 }
 

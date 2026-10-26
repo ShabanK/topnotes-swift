@@ -148,6 +148,7 @@ enum DebugProbe {
     static var tabFrames: [UUID: CGRect] = [:]   // window coordinates, top-left origin
     static var eyeFrame: CGRect = .zero
     static var itemDeleteFrames: [UUID: CGRect] = [:]
+    static var cloaked = true
 }
 
 @MainActor
@@ -159,7 +160,9 @@ func runInteractTestIfRequested() {
     try? FileManager.default.removeItem(at: file)
     let store = NotesStore(fileURL: file)
     store.notes = [Note(text: "secret", name: "Alpha"), Note(name: "Beta"), Note(name: "Gamma wide"), Note(name: "Delta"),
-                   Note(name: "List", isChecklist: true, items: [CheckItem()])]
+                   Note(name: "List", isChecklist: true, items: [CheckItem()]),
+                   // Unnamed (so it stays out of order()), items never edited during the test.
+                   Note(isChecklist: true, items: [CheckItem(text: "alpha item"), CheckItem(text: "beta item")])]
     store.selectedID = store.notes[0].id
 
     let height: CGFloat = 360
@@ -219,7 +222,7 @@ func runInteractTestIfRequested() {
     while !window.isKeyWindow && Date() < deadline { window.makeKeyAndOrderFront(nil); spin(0.1) }
     spin(1.5)
     check(window.isKeyWindow, "test panel is key")
-    check(DebugProbe.tabFrames.count == 5, "tab frames measured")
+    check(DebugProbe.tabFrames.count == store.notes.count, "tab frames measured")
 
     spin(0.5)
     let countBefore = store.notes.count
@@ -265,6 +268,16 @@ func runInteractTestIfRequested() {
     type("W")
     check(alphaText() == beforeHidden, "reopening hides the notes again")
     click(CGPoint(x: DebugProbe.eyeFrame.midX, y: DebugProbe.eyeFrame.midY)); spin(0.4)   // reveal for the rest of the test
+    check(!DebugProbe.cloaked, "eye reveals again after reopening")
+
+    // Right after launch the popover is shown but not key; clicking into it makes it key.
+    // That must not re-hide notes the user just revealed.
+    window.orderOut(nil); spin(0.3)
+    window.orderFrontRegardless(); spin(0.3)                       // shown, not key
+    if DebugProbe.cloaked { click(CGPoint(x: DebugProbe.eyeFrame.midX, y: DebugProbe.eyeFrame.midY)); spin(0.4) }
+    check(!DebugProbe.cloaked, "revealed while the panel is not key")
+    window.makeKey(); spin(0.4)                                    // user clicks into the note
+    check(!DebugProbe.cloaked, "panel becoming key does not re-hide revealed notes")
 
     // Double click renames; Return commits.
     let renameID = betaID
@@ -302,8 +315,25 @@ func runInteractTestIfRequested() {
                                          charactersIgnoringModifiers: "\u{7f}", isARepeat: false, keyCode: 51)!, atStart: false)
     }
     spin(0.5)
+    func cursor() -> String {
+        guard let tv = window.firstResponder as? NSTextView else { return "no text field focused" }
+        let r = tv.selectedRange(), n = (tv.string as NSString).length
+        return r == NSRange(location: n, length: 0) ? "at end" : "selection \(r.location)+\(r.length) of \(n)"
+    }
+    check(cursor() == "at end", "after Backspace the cursor sits at the end of the previous item (\(cursor()))")
     check(listItems().count == beforeBackspace.count - 1 && listItems().map(\.text) == ["first itemmore"],
           "Backspace on an empty item removes it (before: \(beforeBackspace.map(\.text)), after: \(listItems().map(\.text)))")
+
+    // × on the last item moves the cursor to the end of the one above.
+    click(CGPoint(x: DebugProbe.itemDeleteFrames[listItems()[0].id]!.midX - 200, y: DebugProbe.itemDeleteFrames[listItems()[0].id]!.midY))
+    type("\n"); spin(0.5)
+    type("second"); spin(0.3)
+    check(listItems().map(\.text) == ["first itemmore", "second"], "setup: second item typed (items: \(listItems().map(\.text)))")
+    let secondFrame = DebugProbe.itemDeleteFrames[listItems().last!.id]!
+    click(CGPoint(x: secondFrame.midX, y: secondFrame.midY)); spin(0.6)
+    let responderText = (window.firstResponder as? NSTextView)?.string ?? "none"
+    check(responderText == "first itemmore", "after × focus moves to the previous item (focused text: \(responderText))")
+    check(cursor() == "at end", "after × the cursor sits at the end of the previous item (\(cursor()))")
 
     // Remove every item, including the focused last one.
     while let it = listItems().last, let f = DebugProbe.itemDeleteFrames[it.id], listItems().count > 0 {
@@ -312,6 +342,16 @@ func runInteractTestIfRequested() {
         if listItems().count == n { break }
     }
     check(listItems().isEmpty, "removing all items works (left: \(listItems().count))")
+
+    // Focus moving to an item that was never edited must put the cursor at its end, not select it all.
+    let freshID = store.notes.last!.id
+    store.selectedID = freshID; spin(0.6)
+    func freshItems() -> [CheckItem] { store.notes.first { $0.id == freshID }!.items }
+    func focusedText() -> String { (window.firstResponder as? NSTextView)?.string ?? "none" }
+    let betaX = DebugProbe.itemDeleteFrames[freshItems()[1].id]!
+    click(CGPoint(x: betaX.midX, y: betaX.midY)); spin(0.6)
+    check(focusedText() == "alpha item" && cursor() == "at end",
+          "× moving to an untouched item puts the cursor at its end (focused: \(focusedText()), \(cursor()))")
 
     print(failures == 0 ? "ALL PASSED" : "\(failures) FAILED")
     try? FileManager.default.removeItem(at: file)
